@@ -12,21 +12,19 @@ description: 用户要在 Grok Bot 里安装、登录、收发、登出或卸载
 
 `base_info.bot_agent = Grokbot/1.0.0`。连接页显示 Grokbot。微信里的「ClawBot」是腾讯产品名。
 
-仓库：https://github.com/little-thing/grok-wechat-plugin
+仓库：https://github.com/Fenix-H/grok-wechat-plugin
 
 ## 安装
 
-用户发一句「安装这个微信插件 https://github.com/little-thing/grok-wechat-plugin」即完成本渠道安装。技能就是本文件（本插件 `skills/wechat-channel/SKILL.md`）。
+用户发一句「安装这个微信插件 https://github.com/Fenix-H/grok-wechat-plugin」即完成本渠道安装。技能就是本文件（本插件 `skills/wechat-channel/SKILL.md`）。
 
 安装完成后 Grok Bot 上具备：
 
 1. **连接器** `grok-wechat`，入口 `server/index.js`。用户若需确认则点「加」添加连接器。
 2. **插件文件**落在 Grok Bot 电脑（`/home/box/grok-wechat-plugin`）。
 3. **monitor 自启**：用户登录或 MCP `initialize` 时调用 `wechat_start_monitor` 拉起后台长轮询。已绑定账号时，每个账号独立长轮询入站。
-4. **安装助手**创建两条 Routine（全渠道共用，只建一次）：
-   - **「微信入站唤醒」**（webhook）：入站后 `wechat_inbox` → 按 `ilink_bot_id` 转交专属助手，专属助手立刻向该微信对端 `wechat_send`
-   - **「微信监听保活」**：每 5 分钟，提示词 `只调用 wechat_start_monitor，确保微信入站监听在跑。除此之外什么都不要做。`
-5. **全局 webhook（粘贴一次）**：Grok Bot 创建 webhook Routine 时**不会**把 url/key 返回给 agent；用户从该 Routine 面板复制 **webhook 地址**和**密钥**发来一次。安装助手调用 `wechat_set_wake`（url、key，省略 `ilink_bot_id`）写入全局 `wake.json`（权限 600），当前及后续所有已绑定账号共用。`wechat_status` 的 `global_wake_configured=true` 表示入站已就绪。
+4. **安装助手**只创建一条 Routine（全渠道共用，只建一次）：**「微信入站唤醒」**（webhook）。入站后 `wechat_inbox` → 按 `ilink_bot_id` 转交专属助手，专属助手立刻向该微信对端 `wechat_send`。不要创建「微信监听保活」，也不要每 5 分钟调用模型。入站长轮询由本机 `wechat_start_monitor` 完成。
+5. **全局 webhook（环境变量）**：在进程环境设置 `GROK_WECHAT_WAKE_URL`（https）和 `GROK_WECHAT_WAKE_KEY`。不要把密钥贴进对话。安装助手调用 `wechat_set_wake` 且不传 url/key，写入全局 `wake.json`（只存地址，权限 600）。`wechat_status` 的 `global_wake_configured=true` 表示环境变量已就绪。
 6. **扫码绑定**：`wechat_login_start` 出码并向用户展示 → 立即 `wechat_login_wait`，重复调用直至 `logged_in=true`；若 `expired=true` 则重新 `wechat_login_start` 后再 `wechat_login_wait`。对方先发一条才有 context_token。
 
 每次扫码绑定成功后：
@@ -51,7 +49,7 @@ stdio 支持换行分隔 JSON 与 Content-Length 分帧。
 |---|---|
 | `wechat_login_start` | 出码并展示给用户，下一步立即 `wechat_login_wait` |
 | `wechat_login_wait` | 轮询扫码；`logged_in=true` 时拉起 monitor；`expired=true` 时重新出码 |
-| `wechat_set_wake` | 保存全局 webhook（url、key 必填）。可选 `ilink_bot_id` 同时写入该账号 |
+| `wechat_set_wake` | 从环境变量 `GROK_WECHAT_WAKE_URL` / `GROK_WECHAT_WAKE_KEY` 保存全局 webhook。不要在参数里另写密钥 |
 | `wechat_set_dedicated_assistant` | 为已绑定账号登记专属助手 `assistant_id` / `assistant_name`。创建时描述写明：入站转交后立刻向该微信对端回复 |
 | `wechat_status` | 账号列表、`global_wake_configured`、各号专属助手 / peers、allowlist、inbox、monitor |
 | `wechat_inbox` | 立即取出 monitor 缓存的入站消息（取出后清空） |
@@ -113,4 +111,4 @@ stdio 支持换行分隔 JSON 与 Content-Length 分帧。
 - 无 monitor 进程
 - 无「微信入站唤醒」「微信监听保活」Routine
 - 用户已在侧栏删除 `dedicated_assistants_sidebar_delete` 所列专属助手
-- 重装后 `wechat_status` 为零账号，需重新粘贴 webhook 并扫码
+- 重装后 `wechat_status` 为零账号，需重新设置 webhook 环境变量并扫码

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
+import { aesEcbPaddedSize, encryptAesEcb, ingestItemMedia } from "./media.js";
+import { assertWakeArgsMatchEnv, probeWebhook, readSendableMedia } from "./safety.js";
 import {
   contextFor,
   emptyAccount,
@@ -10,7 +11,6 @@ import {
   listAccounts,
   loadState,
   localTokenList,
-  paths,
   peekInboxCount,
   rememberContext,
   resolveAccountForPeer,
@@ -76,8 +76,11 @@ async function fetchText(url, init, timeoutMs) {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, { ...init, signal: controller.signal });
+    if (!res.ok) {
+      await res.body?.cancel?.().catch(() => {});
+      throw new Error(`HTTP ${res.status}`);
+    }
     const text = await res.text();
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 400)}`);
     return { text, headers: res.headers };
   } finally {
     clearTimeout(timer);
@@ -90,7 +93,7 @@ export async function apiGet(baseUrl, endpoint, timeoutMs = API_TIMEOUT_MS) {
     { method: "GET", headers: commonHeaders() },
     timeoutMs,
   );
-  return JSON.parse(text);
+  return parseApiJson(text);
 }
 
 export async function apiPost(baseUrl, endpoint, body, token, timeoutMs = API_TIMEOUT_MS) {
@@ -103,7 +106,15 @@ export async function apiPost(baseUrl, endpoint, body, token, timeoutMs = API_TI
     },
     timeoutMs,
   );
-  return JSON.parse(text);
+  return parseApiJson(text);
+}
+
+function parseApiJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error("接口返回的不是 JSON");
+  }
 }
 
 function accountSummary(account) {
@@ -255,42 +266,8 @@ export async function getUpdates(account) {
   return { ...data, session_expired: false };
 }
 
-function parseAesKey(raw) {
-  if (!raw) throw new Error("缺少 aes_key");
-  const decoded = Buffer.from(raw, "base64");
-  if (decoded.length === 16) return decoded;
-  const asText = decoded.toString("utf8");
-  if (/^[0-9a-fA-F]{32}$/.test(asText)) return Buffer.from(asText, "hex");
-  if (decoded.length === 32 && /^[0-9a-fA-F]+$/.test(decoded.toString("ascii"))) {
-    return Buffer.from(decoded.toString("ascii"), "hex");
-  }
-  throw new Error("无法解析 aes_key");
-}
-
-function aesEcb(buffer, key, mode) {
-  const cipher = mode === "encrypt"
-    ? crypto.createCipheriv("aes-128-ecb", key, null)
-    : crypto.createDecipheriv("aes-128-ecb", key, null);
-  return Buffer.concat([cipher.update(buffer), cipher.final()]);
-}
-
 function paddedSize(n) {
-  return Math.ceil((n + 1) / 16) * 16;
-}
-
-async function downloadMedia(media, label) {
-  const param = media?.encrypt_query_param || "";
-  const fullUrl = media?.full_url || "";
-  if (!param && !fullUrl) return null;
-  const url = fullUrl || `${CDN_BASE}/download?encrypted_query_param=${encodeURIComponent(param)}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`下载媒体失败 ${res.status}`);
-  const cipher = Buffer.from(await res.arrayBuffer());
-  const key = parseAesKey(media.aes_key);
-  const plain = aesEcb(cipher, key, "decrypt");
-  const file = path.join(paths().media, `${Date.now()}-${label}`);
-  fs.writeFileSync(file, plain);
-  return file;
+  return aesEcbPaddedSize(n);
 }
 
 function itemText(item) {
@@ -308,15 +285,25 @@ export async function normalizeInbound(msg) {
     const type = item.type;
     const piece = itemText(item);
     if (piece) text = text ? `${text}\n${piece}` : piece;
-    if (type === ITEM.IMAGE && item.image_item?.media) {
-      const file = await downloadMedia(item.image_item.media, `image-${i}.bin`).catch(() => null);
-      items.push({ type: "image", path: file });
+    if (type === ITEM.IMAGE && item.image_item) {
+      items.push(await ingestItemMedia({
+        role: "image",
+        imageItem: item.image_item,
+        media: item.image_item.media,
+        declaredName: `image-${i}`,
+      }));
     } else if (type === ITEM.FILE && item.file_item) {
-      const file = await downloadMedia(item.file_item.media, item.file_item.file_name || `file-${i}`).catch(() => null);
-      items.push({ type: "file", name: item.file_item.file_name || "", path: file });
-    } else if (type === ITEM.VIDEO && item.video_item?.media) {
-      const file = await downloadMedia(item.video_item.media, `video-${i}.bin`).catch(() => null);
-      items.push({ type: "video", path: file });
+      items.push(await ingestItemMedia({
+        role: "file",
+        media: item.file_item.media,
+        declaredName: item.file_item.file_name || `file-${i}`,
+      }));
+    } else if (type === ITEM.VIDEO && item.video_item) {
+      items.push(await ingestItemMedia({
+        role: "video",
+        media: item.video_item.media,
+        declaredName: `video-${i}`,
+      }));
     } else if (type === ITEM.VOICE && item.voice_item) {
       items.push({ type: "voice", text: item.voice_item.text || "", playtime_ms: item.voice_item.playtime });
     } else if (type === ITEM.TEXT) {
@@ -412,11 +399,12 @@ export async function sendText(toUserId, text, ilinkBotId) {
 }
 
 async function uploadFile(account, to, filePath, mediaType) {
-  const raw = fs.readFileSync(filePath);
+  const file = readSendableMedia(filePath);
+  const raw = file.bytes;
   const rawMd5 = crypto.createHash("md5").update(raw).digest("hex");
   const aesKey = crypto.randomBytes(16);
   const aesKeyHex = aesKey.toString("hex");
-  const cipher = aesEcb(raw, aesKey, "encrypt");
+  const cipher = encryptAesEcb(raw, aesKey);
   const filekey = crypto.randomBytes(16).toString("hex");
   const upload = await apiPost(
     account.baseUrl,
@@ -449,6 +437,7 @@ async function uploadFile(account, to, filePath, mediaType) {
     fileSizeCiphertext: cipher.length,
     aeskeyHex: aesKeyHex,
     downloadEncryptedQueryParam: downloadParam,
+    displayName: path.basename(file.path),
   };
 }
 
@@ -466,7 +455,6 @@ export async function sendMedia(toUserId, filePath, kind, caption, ilinkBotId) {
   const to = toUserId;
   const token = contextFor(account, to);
   if (!token) throw new Error("还没有该用户的 context_token，需对方先发一条微信");
-  if (!fs.existsSync(filePath)) throw new Error(`文件不存在: ${filePath}`);
   const typeMap = { image: UPLOAD.IMAGE, video: UPLOAD.VIDEO, file: UPLOAD.FILE };
   const mediaType = typeMap[kind];
   if (!mediaType) throw new Error("kind 只能是 image / video / file");
@@ -481,7 +469,7 @@ export async function sendMedia(toUserId, filePath, kind, caption, ilinkBotId) {
   }
   return sendItem(account, to, {
     type: ITEM.FILE,
-    file_item: { media, file_name: path.basename(filePath), len: String(uploaded.fileSize) },
+    file_item: { media, file_name: uploaded.displayName, len: String(uploaded.fileSize) },
   }, token);
 }
 
@@ -536,31 +524,28 @@ export function statusPayload() {
   };
 }
 
-export async function probeWake(url, key) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      source: "grok-wechat",
-      probe: true,
-      count: 0,
-    }),
-  });
-  const text = await res.text();
-  return { status: res.status, body: text.slice(0, 180) };
-}
-
-export async function setAccountWake(ilink_bot_id, url, key) {
-  if (!url || !key) throw new Error("url 和 key 必填");
-  const probe = await probeWake(url, key);
-  saveGlobalWake(url, key);
+export async function setAccountWake(ilink_bot_id, url, key, options = {}) {
+  const env = assertWakeArgsMatchEnv(url, key);
+  let probeStatus = null;
+  let probeError = null;
+  try {
+    const probe = await probeWebhook(options);
+    probeStatus = probe.status;
+  } catch (err) {
+    probeError = err instanceof Error ? err.message : String(err);
+    if (!probeError.includes("重定向") && !probeError.includes("公网") && !probeError.includes("解析") && !probeError.includes("超时") && !probeError.includes("https")) {
+      probeError = "webhook 探针失败";
+    }
+  }
+  if (probeError && /公网|解析|https|主机无效|地址无效|地址为空/.test(probeError)) {
+    throw new Error(probeError);
+  }
+  saveGlobalWake(env.url);
   if (ilink_bot_id) {
     updateState((s) => {
       const hit = findAccount(s, { ilink_bot_id });
-      if (hit) hit.wake = { url, key };
+      if (!hit?.token) throw new Error("未找到要配置的账号");
+      hit.wake = { url: env.url };
       return s;
     });
   }
@@ -568,7 +553,8 @@ export async function setAccountWake(ilink_bot_id, url, key) {
   return {
     global_wake_configured: true,
     ilink_bot_id: ilink_bot_id || null,
-    probe,
+    probe_status: probeStatus,
+    probe_error: probeError,
     accounts: listAccounts(loadState()).map(accountSummary),
   };
 }

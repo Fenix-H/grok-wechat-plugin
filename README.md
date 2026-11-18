@@ -19,7 +19,7 @@ Grok Bot 的微信 iLink 渠道。扫码绑定个人号后，私信经共享 web
 在 Grok Bot 里发：
 
 ```
-安装这个微信插件 https://github.com/little-thing/grok-wechat-plugin
+安装这个微信插件 https://github.com/Fenix-H/grok-wechat-plugin
 ```
 
 ## 绑定流程
@@ -32,7 +32,7 @@ Grok Bot 的微信 iLink 渠道。扫码绑定个人号后，私信经共享 web
    对话里会出现「加」按钮，点一下，把微信渠道接到 Grok Bot。
 
 2. **连接器与共用 Routine**  
-   安装助手加上微信连接器，并创建两条 Routine：**「微信入站唤醒」**（Webhook）与 **「微信监听保活」**（每 5 分钟 `wechat_start_monitor`）。webhook Routine 创建后平台不把 url/key 返回给 agent；用户从该 Routine 面板复制地址与密钥发来**一次**，安装助手 `wechat_set_wake` 写入全局 `wake.json`，当前及后续绑定账号共用。
+   安装助手加上微信连接器，并只创建 **「微信入站唤醒」**（Webhook）。不要创建每 5 分钟的监听保活。进程环境提供 `GROK_WECHAT_WAKE_URL` 与 `GROK_WECHAT_WAKE_KEY`，安装助手调用 `wechat_set_wake` 且不把密钥写进对话。盒子上的启动、文本收发和媒体说明见 `docs/DEPLOY.md`。已绑定账号的 `~/.grok-wechat/account.json` 保持不动。
 
 3. **扫码登录微信**  
    `wechat_login_start` 出码 → 立即 `wechat_login_wait` 至 `logged_in=true`。每次绑定成功后**创建该号的专属 Grok Bot 助手**，描述为：

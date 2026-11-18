@@ -2,8 +2,11 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
+import { postWebhook, readWakeEnv, redactSensitive } from "./safety.js";
+import { isTextCommand, runTextCommand } from "./text-cli.js";
 import {
   appendInbox,
+  appendPrivateLog,
   clearPid,
   drainInbox,
   findAccount,
@@ -13,7 +16,6 @@ import {
   monitorRunning,
   paths,
   removeAccount,
-  resolveWakeForAccount,
   stopMonitorProcess,
   updateState,
   writePid,
@@ -37,11 +39,7 @@ import { registerShutdownCleanup, touchConnectorActive, connectorAbandoned, runU
 const self = fileURLToPath(import.meta.url);
 
 try {
-  fs.mkdirSync("/workspace/.grok-wechat", { recursive: true });
-  fs.appendFileSync(
-    "/workspace/.grok-wechat/mcp-host.log",
-    `${new Date().toISOString()} spawn pid=${process.pid} argv=${JSON.stringify(process.argv)} cwd=${process.cwd()}\n`,
-  );
+  appendPrivateLog("mcp-host.log", `${new Date().toISOString()} spawn pid=${process.pid}\n`);
 } catch { /* ignore */ }
 try {
   if (process.stdout._handle?.setBlocking) process.stdout._handle.setBlocking(true);
@@ -215,15 +213,14 @@ const tools = {
     handle: async () => ok(ensureMonitor()),
   },
   wechat_set_wake: {
-    description: "保存全局入站 webhook（wake.json，权限 600），供当前及后续所有已绑定账号共用。ilink_bot_id 可选；传入时同时写入该账号并仍保留全局配置。",
+    description: "把环境变量 GROK_WECHAT_WAKE_URL 与 GROK_WECHAT_WAKE_KEY 写入全局 wake 配置（wake.json 只存地址，权限 600）。不要在参数里另给地址或密钥；省略 url/key 即使用环境变量。探针请求不携带密钥。",
     inputSchema: {
       type: "object",
       properties: {
-        url: { type: "string", description: "安装助手 Routine「微信入站唤醒」的 webhook 地址" },
-        key: { type: "string", description: "webhook 密钥" },
-        ilink_bot_id: { type: "string", description: "可选，同时写入该已绑定账号；省略则仅设置全局 wake" },
+        url: { type: "string", description: "可选，必须与 GROK_WECHAT_WAKE_URL 完全一致" },
+        key: { type: "string", description: "可选，必须与 GROK_WECHAT_WAKE_KEY 完全一致；不会写入文件或探针请求" },
+        ilink_bot_id: { type: "string", description: "可选，同时给该已绑定账号记下同一个地址" },
       },
-      required: ["url", "key"],
     },
     handle: async ({ ilink_bot_id, url, key }) => ok(await setAccountWake(ilink_bot_id, url, key)),
   },
@@ -296,13 +293,13 @@ function writeMessage(msg) {
   const json = JSON.stringify(msg);
   fs.writeSync(1, json + "\n");
   try {
-    fs.appendFileSync("/workspace/.grok-wechat/mcp-host.log", `${new Date().toISOString()} out ${json.slice(0, 200)}\n`);
+    appendPrivateLog("mcp-host.log", `${new Date().toISOString()} out id=${msg.id ?? ""} method-reply\n`);
   } catch { /* ignore */ }
 }
 
 async function onRpc(msg) {
   try {
-    fs.appendFileSync("/workspace/.grok-wechat/mcp-host.log", `${new Date().toISOString()} in ${JSON.stringify({id: msg.id, method: msg.method}).slice(0,300)}\n`);
+    appendPrivateLog("mcp-host.log", `${new Date().toISOString()} in method=${msg.method || ""} id=${msg.id ?? ""}\n`);
   } catch { /* ignore */ }
   const { id, method, params } = msg;
   if (method === "initialize") {
@@ -382,6 +379,17 @@ function startMcp() {
 
 async function wakeAgent(messages, log) {
   if (!messages.length) return;
+  let env;
+  try {
+    env = readWakeEnv();
+  } catch (err) {
+    log(`wake skipped: ${redactSensitive(err instanceof Error ? err.message : String(err))}`);
+    return;
+  }
+  if (!env) {
+    log("wake skipped: webhook env not set");
+    return;
+  }
   const state = loadState();
   const byBot = new Map();
   for (const m of messages) {
@@ -391,30 +399,17 @@ async function wakeAgent(messages, log) {
   }
   for (const [botId, batch] of byBot) {
     const account = findAccount(state, { ilink_bot_id: botId });
-    const cfg = resolveWakeForAccount(account);
-    if (!cfg) {
-      log(`wake skipped bot=${botId}: no wake config`);
-      continue;
-    }
     try {
-      const res = await fetch(cfg.url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${cfg.key}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          source: "grok-wechat",
-          count: batch.length,
-          from_user_ids: batch.map((m) => m.from_user_id),
-          ilink_bot_id: botId,
-          ilink_user_id: account?.ilinkUserId || batch[0]?.ilink_user_id || "",
-        }),
+      const result = await postWebhook({
+        source: "grok-wechat",
+        count: batch.length,
+        from_user_ids: batch.map((m) => m.from_user_id),
+        ilink_bot_id: botId,
+        ilink_user_id: account?.ilinkUserId || batch[0]?.ilink_user_id || "",
       });
-      const text = await res.text();
-      log(`wake bot=${botId} ${res.status} ${text.slice(0, 180)}`);
+      log(`wake bot=${botId} status=${result.status}`);
     } catch (err) {
-      log(`wake error bot=${botId} ${err instanceof Error ? err.message : String(err)}`);
+      log(`wake error bot=${botId} ${redactSensitive(err instanceof Error ? err.message : String(err))}`);
     }
   }
 }
@@ -432,7 +427,11 @@ async function pollAccount(account, log) {
 }
 
 async function runMonitor() {
-  const logStream = fs.createWriteStream(paths().log, { flags: "a" });
+  const logPath = paths().log;
+  const logStream = fs.createWriteStream(logPath, { flags: "a", mode: 0o600 });
+  logStream.on("open", () => {
+    try { fs.chmodSync(logPath, 0o600); } catch { /* ignore */ }
+  });
   const log = (line) => {
     logStream.write(`${new Date().toISOString()} ${line}\n`);
   };
@@ -486,6 +485,13 @@ if (process.argv.includes("--monitor")) {
   process.stdout.write(JSON.stringify(ensureMonitor()) + "\n");
 } else if (process.argv.includes("--uninstall")) {
   process.stdout.write(`${JSON.stringify(runUninstall({ deferPluginRemoval: false }), null, 2)}\n`);
+} else if (isTextCommand(process.argv)) {
+  runTextCommand(process.argv).then((payload) => {
+    process.stdout.write(`${JSON.stringify(payload)}\n`);
+  }).catch((err) => {
+    process.stderr.write(`${redactSensitive(err instanceof Error ? err.message : String(err))}\n`);
+    process.exitCode = 1;
+  });
 } else {
   startMcp();
 }
