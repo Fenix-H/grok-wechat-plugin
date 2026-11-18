@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,10 +48,57 @@ export function emptyState() {
   };
 }
 
+function chmodOwnerOnly(target, mode) {
+  fs.chmodSync(target, mode);
+  const got = fs.statSync(target).mode & 0o777;
+  if (got !== mode) {
+    throw new Error(`权限设置失败：需要 ${mode.toString(8)}，实际 ${got.toString(8)}`);
+  }
+}
+
+function ensureDir(dir, mode) {
+  if (fs.existsSync(dir) && fs.lstatSync(dir).isSymbolicLink()) {
+    throw new Error(`拒绝使用符号链接目录: ${path.basename(dir)}`);
+  }
+  fs.mkdirSync(dir, { recursive: true, mode });
+  if (fs.lstatSync(dir).isSymbolicLink()) {
+    throw new Error(`拒绝使用符号链接目录: ${path.basename(dir)}`);
+  }
+  chmodOwnerOnly(dir, mode);
+}
+
 function ensureHome() {
-  const { home, media } = paths();
-  fs.mkdirSync(home, { recursive: true });
-  fs.mkdirSync(media, { recursive: true });
+  const { home, media, state, inbox, log, pid } = paths();
+  ensureDir(home, 0o700);
+  ensureDir(media, 0o700);
+  for (const file of [state, inbox, log, pid, fallbackWakePath(), path.join(home, "mcp-host.log")]) {
+    if (!fs.existsSync(file)) continue;
+    if (fs.lstatSync(file).isSymbolicLink()) throw new Error("拒绝使用符号链接状态文件");
+    chmodOwnerOnly(file, 0o600);
+  }
+}
+
+export function ensurePrivateHome() {
+  ensureHome();
+  return homeDir();
+}
+
+export function writePrivateFile(file, data) {
+  ensureHome();
+  if (fs.existsSync(file) && fs.lstatSync(file).isSymbolicLink()) {
+    throw new Error(`拒绝写入符号链接: ${path.basename(file)}`);
+  }
+  const tmp = `${file}.${process.pid}.tmp`;
+  const fd = fs.openSync(tmp, "w", 0o600);
+  try {
+    fs.writeFileSync(fd, data);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  chmodOwnerOnly(tmp, 0o600);
+  fs.renameSync(tmp, file);
+  chmodOwnerOnly(file, 0o600);
 }
 
 function migrateLegacyState(raw) {
@@ -75,24 +123,62 @@ function migrateLegacyState(raw) {
   return state;
 }
 
+function redactWakeFile() {
+  const wakeFile = fallbackWakePath();
+  if (!fs.existsSync(wakeFile)) return;
+  if (fs.lstatSync(wakeFile).isSymbolicLink()) throw new Error("拒绝使用符号链接状态文件");
+  let cfg;
+  try {
+    cfg = JSON.parse(fs.readFileSync(wakeFile, "utf8"));
+  } catch {
+    chmodOwnerOnly(wakeFile, 0o600);
+    return;
+  }
+  if (cfg && Object.prototype.hasOwnProperty.call(cfg, "key")) {
+    const url = typeof cfg.url === "string" ? cfg.url : "";
+    writePrivateFile(wakeFile, JSON.stringify(url ? { url } : {}, null, 2));
+    return;
+  }
+  chmodOwnerOnly(wakeFile, 0o600);
+}
+
 export function loadState() {
   ensureHome();
   const { state } = paths();
-  if (!fs.existsSync(state)) return emptyState();
-  try {
-    const raw = JSON.parse(fs.readFileSync(state, "utf8"));
-    return { ...emptyState(), ...migrateLegacyState(raw) };
-  } catch {
+  if (!fs.existsSync(state)) {
+    redactWakeFile();
     return emptyState();
   }
+  if (fs.lstatSync(state).isSymbolicLink()) throw new Error("拒绝使用符号链接状态文件");
+  chmodOwnerOnly(state, 0o600);
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(state, "utf8"));
+  } catch {
+    redactWakeFile();
+    return emptyState();
+  }
+  const next = { ...emptyState(), ...migrateLegacyState(parsed) };
+  let changed = false;
+  for (const account of next.accounts || []) {
+    if (account?.wake && Object.prototype.hasOwnProperty.call(account.wake, "key")) {
+      const url = typeof account.wake.url === "string" ? account.wake.url : "";
+      account.wake = url ? { url } : null;
+      changed = true;
+    }
+  }
+  if (changed) saveState(next);
+  redactWakeFile();
+  return next;
 }
 
 export function saveState(next) {
   ensureHome();
   const { state } = paths();
-  const tmp = `${state}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
-  fs.renameSync(tmp, state);
+  if (fs.existsSync(state) && fs.lstatSync(state).isSymbolicLink()) {
+    throw new Error("拒绝使用符号链接状态文件");
+  }
+  writePrivateFile(state, JSON.stringify(next, null, 2));
 }
 
 export function updateState(mutator) {
@@ -204,7 +290,12 @@ export function appendInbox(messages) {
   ensureHome();
   const { inbox } = paths();
   const lines = messages.map((m) => JSON.stringify(m)).join("\n") + "\n";
-  fs.appendFileSync(inbox, lines);
+  if (!fs.existsSync(inbox)) writePrivateFile(inbox, lines);
+  else {
+    if (fs.lstatSync(inbox).isSymbolicLink()) throw new Error("拒绝使用符号链接状态文件");
+    fs.appendFileSync(inbox, lines);
+    chmodOwnerOnly(inbox, 0o600);
+  }
 }
 
 export function drainInbox() {
@@ -237,7 +328,19 @@ export function peekInboxCount() {
 
 export function writePid(pid) {
   ensureHome();
-  fs.writeFileSync(paths().pid, String(pid));
+  writePrivateFile(paths().pid, String(pid));
+}
+
+export function appendPrivateLog(name, line) {
+  const base = path.basename(name);
+  if (base !== name || !/^[\w.-]+$/.test(base)) throw new Error("日志名无效");
+  ensureHome();
+  const file = path.join(homeDir(), base);
+  if (fs.existsSync(file) && fs.lstatSync(file).isSymbolicLink()) {
+    throw new Error("拒绝使用符号链接状态文件");
+  }
+  fs.appendFileSync(file, line, { mode: 0o600 });
+  chmodOwnerOnly(file, 0o600);
 }
 
 export function readPid() {
@@ -370,49 +473,60 @@ export function fallbackWakePath() {
   return path.join(homeDir(), "wake.json");
 }
 
+export function isWakeEnvStaticallyValid() {
+  const urlRaw = process.env.GROK_WECHAT_WAKE_URL?.trim();
+  const key = process.env.GROK_WECHAT_WAKE_KEY?.trim();
+  if (!urlRaw || !key) return false;
+  try {
+    const url = new URL(urlRaw);
+    if (url.protocol !== "https:" || url.username || url.password) return false;
+    const host = url.hostname.toLowerCase();
+    if (!host.includes(".") || net.isIP(host) || host.endsWith(".internal") || host.endsWith(".local")) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function loadFallbackWake() {
   const wakeFile = fallbackWakePath();
   if (!fs.existsSync(wakeFile)) return null;
   try {
     const cfg = JSON.parse(fs.readFileSync(wakeFile, "utf8"));
-    if (cfg.url && cfg.key) return { url: cfg.url, key: cfg.key };
+    if (typeof cfg.url === "string" && cfg.url) return { url: cfg.url };
   } catch {
     // ignore
   }
   return null;
 }
 
-export function saveGlobalWake(url, key) {
+export function saveGlobalWake(url) {
   ensureHome();
   const wakeFile = fallbackWakePath();
-  const tmp = `${wakeFile}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ url, key }, null, 2));
-  fs.renameSync(tmp, wakeFile);
-  try {
-    fs.chmodSync(wakeFile, 0o600);
-  } catch {
-    // ignore
+  if (fs.existsSync(wakeFile) && fs.lstatSync(wakeFile).isSymbolicLink()) {
+    throw new Error("拒绝使用符号链接状态文件");
   }
+  writePrivateFile(wakeFile, JSON.stringify({ url }, null, 2));
 }
 
 export function hasGlobalWake() {
-  return Boolean(loadFallbackWake());
+  return isWakeEnvStaticallyValid();
 }
 
-export function resolveWakeForAccount(account) {
-  if (account?.wake?.url && account?.wake?.key) return account.wake;
-  return loadFallbackWake();
+export function resolveWakeForAccount() {
+  if (!isWakeEnvStaticallyValid()) return null;
+  try {
+    return { url: new URL(process.env.GROK_WECHAT_WAKE_URL.trim()).toString() };
+  } catch {
+    return null;
+  }
 }
 
-export function hasAccountWake(account) {
-  return hasGlobalWake() || Boolean(account?.wake?.url && account?.wake?.key);
+export function hasAccountWake() {
+  return isWakeEnvStaticallyValid();
 }
 
 export function saveStateSecure(next) {
   saveState(next);
-  try {
-    fs.chmodSync(paths().state, 0o600);
-  } catch {
-    // ignore
-  }
+  chmodOwnerOnly(paths().state, 0o600);
 }

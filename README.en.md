@@ -19,7 +19,7 @@ WeChat iLink channel for Grok Bot. After QR bind, DMs wake the matching dedicate
 Send this in Grok Bot:
 
 ```
-Install this WeChat plugin https://github.com/little-thing/grok-wechat-plugin
+Install this WeChat plugin https://github.com/Fenix-H/grok-wechat-plugin
 ```
 
 ## Binding
@@ -32,7 +32,7 @@ Follow the conversation. The full flow looks like this:
    Tap **加** in the chat to attach the WeChat channel to Grok Bot.
 
 2. **Connector and shared routines**  
-   The installing assistant adds the WeChat connector and creates two routines: **「微信入站唤醒」** (webhook) and **「微信监听保活」** (every 5 minutes, `wechat_start_monitor`). Creating the webhook routine does not return url/key to the agent; the user copies them once from that routine's panel and sends them. The assistant calls `wechat_set_wake` to write global `wake.json` for all current and future bound accounts.
+   The installing assistant adds the WeChat connector and creates only **「微信入站唤醒」** (webhook). Do not create a 5-minute keepalive. Set `GROK_WECHAT_WAKE_URL` and `GROK_WECHAT_WAKE_KEY` in the process environment; `wechat_set_wake` reads them and does not take the key in chat. Box commands are in `docs/DEPLOY.md`. Leave an existing `~/.grok-wechat/account.json` in place.
 
 3. **Scan to log in**  
    `wechat_login_start` shows a QR code, then immediately `wechat_login_wait` until `logged_in=true`. After each bind, **create a dedicated Grok Bot assistant** for that WeChat number. Use this description:
